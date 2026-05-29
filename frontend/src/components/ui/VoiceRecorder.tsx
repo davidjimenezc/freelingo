@@ -21,13 +21,42 @@ export function VoiceRecorder({
 }: VoiceRecorderProps) {
   const [state, setState] = useState<RecorderState>('idle')
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const recordingStartedAtRef = useRef<number>(0)
   const t = useTranslations('voiceRecorder')
+
+  function getBestMimeType(): string | undefined {
+    const candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/ogg',
+      'audio/mp4',
+    ]
+    return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate))
+  }
+
+  function extensionForMimeType(mimeType: string | undefined): string {
+    if (!mimeType) return 'webm'
+    if (mimeType.includes('ogg')) return 'ogg'
+    if (mimeType.includes('mp4')) return 'm4a'
+    if (mimeType.includes('wav')) return 'wav'
+    return 'webm'
+  }
 
   async function handleClick() {
     if (disabled) return
 
     if (state === 'recording') {
-      mediaRecorderRef.current?.stop()
+      const recorder = mediaRecorderRef.current
+      if (recorder?.state === 'recording') {
+        try {
+          recorder.requestData()
+        } catch {
+          // Some browsers throw if no chunk is available yet; stop() will still
+          // trigger a final dataavailable event when possible.
+        }
+        recorder.stop()
+      }
       return
     }
 
@@ -36,11 +65,12 @@ export function VoiceRecorder({
     setState('recording')
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/ogg'
-      const recorder = new MediaRecorder(stream, { mimeType })
+      const mimeType = getBestMimeType()
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream)
       mediaRecorderRef.current = recorder
+      recordingStartedAtRef.current = Date.now()
       const chunks: Blob[] = []
 
       recorder.ondataavailable = (e) => {
@@ -51,9 +81,14 @@ export function VoiceRecorder({
         stream.getTracks().forEach((t) => t.stop())
         setState('transcribing')
         try {
-          const blob = new Blob(chunks, { type: mimeType })
+          const blobType = recorder.mimeType || mimeType || 'audio/webm'
+          const blob = new Blob(chunks, { type: blobType })
+          const elapsedMs = Date.now() - recordingStartedAtRef.current
+          if (elapsedMs < 400 || blob.size < 1024) {
+            throw new Error(`Recording too short or empty (${blob.size} bytes)`)
+          }
           const formData = new FormData()
-          formData.append('audio', blob, 'recording.webm')
+          formData.append('audio', blob, `recording.${extensionForMimeType(blobType)}`)
 
           const res = await apiFetch('/api/stt', {
             method: 'POST',
@@ -69,7 +104,9 @@ export function VoiceRecorder({
         }
       }
 
-      recorder.start()
+      // Request periodic chunks so short recordings still produce complete data
+      // before stop(); without this, some browsers can upload an undecodable blob.
+      recorder.start(250)
       // Auto-stop after maxSeconds
       setTimeout(() => {
         if (recorder.state === 'recording') recorder.stop()

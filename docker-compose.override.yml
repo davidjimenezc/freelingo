@@ -8,6 +8,11 @@ services:
       - "host.docker.internal:host-gateway"
 
   frontend:
+    image: freelingo-frontend-local:voice-fix
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     ports: !override
       - "127.0.0.1:13000:3000"
 
