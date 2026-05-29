@@ -13,8 +13,12 @@ class WhisperSTTService:
         self.base_url = base_url.rstrip("/")
 
     async def health(self) -> None:
-        """Raise if Whisper ASR is unreachable."""
-        async with httpx.AsyncClient() as client:
+        """Raise if Whisper ASR is unreachable.
+
+        onerahmet/openai-whisper-asr-webservice redirects `/` to `/docs`, so
+        following redirects avoids reporting a healthy local STT service as down.
+        """
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             r = await client.get(f"{self.base_url}/", timeout=5.0)
             r.raise_for_status()
 

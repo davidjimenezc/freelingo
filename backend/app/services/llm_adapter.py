@@ -19,6 +19,7 @@ REQUEST_TIMEOUT = 120.0
 
 MAX_CONTEXT_TOKENS = {
     "openai": 128000,
+    "openrouter": 128000,
     "anthropic": 200000,
     "deepseek": 128000,
     "ollama": 8192,
@@ -109,6 +110,24 @@ class LLMAdapter:
         elif self.provider == "openai":
             self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             self.model = settings.OPENAI_MODEL
+        elif self.provider == "openrouter":
+            if not (
+                settings.OPENROUTER_MODEL.endswith(":free")
+                or settings.OPENROUTER_MODEL == "openrouter/free"
+            ):
+                raise LLMError(
+                    "OpenRouter is configured to allow only free models. "
+                    "Set OPENROUTER_MODEL to a ':free' model id or 'openrouter/free'."
+                )
+            self.client = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=settings.OPENROUTER_API_KEY,
+                default_headers={
+                    "HTTP-Referer": settings.APP_BASE_URL,
+                    "X-Title": "FreeLingo",
+                },
+            )
+            self.model = settings.OPENROUTER_MODEL
         elif self.provider == "deepseek":
             self.client = AsyncOpenAI(
                 base_url="https://api.deepseek.com/v1",
@@ -166,7 +185,7 @@ class LLMAdapter:
             # None, but no code will break.
             return LLMStream(result) if stream else result
 
-        # For Ollama, OpenAI and DeepSeek (all OpenAI-compatible):
+        # For Ollama, OpenAI, OpenRouter and DeepSeek (all OpenAI-compatible):
         # pass stream_options so the final chunk includes token usage.
         # Defensively build kwargs to stay compatible with older SDK versions.
         extra: dict = {}
@@ -195,12 +214,15 @@ class LLMAdapter:
     async def _structured_via_json(
         self, messages: list[dict], schema: type[BaseModel]
     ) -> BaseModel:
+        schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
         messages_with_format = messages + [
             {
                 "role": "system",
                 "content": (
-                    "IMPORTANT: Respond with ONLY a valid JSON object. "
-                    "No markdown, no code fences, no extra text."
+                    "IMPORTANT: Respond with ONLY a valid JSON object that conforms exactly "
+                    "to this JSON Schema. Include all required fields with the expected types. "
+                    "Do not add markdown, code fences, comments, or extra text.\n\n"
+                    f"JSON Schema: {schema_json}"
                 ),
             }
         ]

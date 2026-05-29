@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "gemma4:e4b"
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "openai/gpt-oss-20b:free"
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_MODEL: str = "claude-3-5-haiku-latest"
     DEEPSEEK_API_KEY: str = ""

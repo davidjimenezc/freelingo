@@ -1,0 +1,27 @@
+services:
+  backend:
+    image: freelingo-backend-local:openrouter
+    pull_policy: build
+    build:
+      context: ./backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    ports: !override
+      - "127.0.0.1:13000:3000"
+
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    deploy: !reset null
+
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    deploy: !reset null
+
+  ollama-proxy:
+    image: alpine/socat:latest
+    container_name: freelingo-ollama-proxy
+    network_mode: host
+    restart: unless-stopped
+    command: TCP-LISTEN:11435,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:11434
