@@ -20,101 +20,153 @@ export function VoiceRecorder({
   className = '',
 }: VoiceRecorderProps) {
   const [state, setState] = useState<RecorderState>('idle')
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const recordingStartedAtRef = useRef<number>(0)
   const t = useTranslations('voiceRecorder')
 
-  function getBestMimeType(): string | undefined {
-    const candidates = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/ogg',
-      'audio/mp4',
-    ]
-    return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate))
+  const streamRef = useRef<MediaStream | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const chunksRef = useRef<Float32Array[]>([])
+  const sampleRateRef = useRef<number>(48000)
+  const recordingStartedAtRef = useRef<number>(0)
+  const autoStopRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  function cleanupRecorder() {
+    if (autoStopRef.current) {
+      clearTimeout(autoStopRef.current)
+      autoStopRef.current = null
+    }
+    processorRef.current?.disconnect()
+    sourceRef.current?.disconnect()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    void audioContextRef.current?.close().catch(() => undefined)
+
+    processorRef.current = null
+    sourceRef.current = null
+    streamRef.current = null
+    audioContextRef.current = null
   }
 
-  function extensionForMimeType(mimeType: string | undefined): string {
-    if (!mimeType) return 'webm'
-    if (mimeType.includes('ogg')) return 'ogg'
-    if (mimeType.includes('mp4')) return 'm4a'
-    if (mimeType.includes('wav')) return 'wav'
-    return 'webm'
+  function encodeWav(samples: Float32Array[], sampleRate: number): Blob {
+    const totalSamples = samples.reduce((sum, chunk) => sum + chunk.length, 0)
+    const buffer = new ArrayBuffer(44 + totalSamples * 2)
+    const view = new DataView(buffer)
+
+    function writeString(offset: number, value: string) {
+      for (let i = 0; i < value.length; i += 1) {
+        view.setUint8(offset + i, value.charCodeAt(i))
+      }
+    }
+
+    writeString(0, 'RIFF')
+    view.setUint32(4, 36 + totalSamples * 2, true)
+    writeString(8, 'WAVE')
+    writeString(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true) // PCM
+    view.setUint16(22, 1, true) // mono
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, sampleRate * 2, true)
+    view.setUint16(32, 2, true)
+    view.setUint16(34, 16, true)
+    writeString(36, 'data')
+    view.setUint32(40, totalSamples * 2, true)
+
+    let offset = 44
+    for (const chunk of samples) {
+      for (let i = 0; i < chunk.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, chunk[i]))
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+        offset += 2
+      }
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' })
+  }
+
+  async function stopRecording() {
+    if (!audioContextRef.current) return
+
+    const elapsedMs = Date.now() - recordingStartedAtRef.current
+    const chunks = chunksRef.current.slice()
+    const sampleRate = sampleRateRef.current
+    cleanupRecorder()
+    setState('transcribing')
+
+    try {
+      const sampleCount = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+      if (elapsedMs < 400 || sampleCount < sampleRate * 0.25) {
+        throw new Error(`Recording too short (${sampleCount} samples)`)
+      }
+
+      const blob = encodeWav(chunks, sampleRate)
+      const formData = new FormData()
+      formData.append('audio', blob, 'recording.wav')
+
+      const res = await apiFetch('/api/stt', {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) throw new Error(`STT error ${res.status}`)
+      const { text } = (await res.json()) as { text: string }
+      onTranscription(text)
+      setState('idle')
+    } catch {
+      setState('error')
+      setTimeout(() => setState('idle'), 2000)
+    }
+  }
+
+  async function startRecording() {
+    setState('recording')
+    try {
+      chunksRef.current = []
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const audioWindow = window as Window &
+        typeof globalThis & { webkitAudioContext?: typeof AudioContext }
+      const AudioContextCtor = audioWindow.AudioContext || audioWindow.webkitAudioContext
+      if (!AudioContextCtor) throw new Error('AudioContext is not supported')
+      const audioContext = new AudioContextCtor()
+      const source = audioContext.createMediaStreamSource(stream)
+      const processor = audioContext.createScriptProcessor(4096, 1, 1)
+
+      streamRef.current = stream
+      audioContextRef.current = audioContext
+      sourceRef.current = source
+      processorRef.current = processor
+      sampleRateRef.current = audioContext.sampleRate
+      recordingStartedAtRef.current = Date.now()
+
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0)
+        chunksRef.current.push(new Float32Array(input))
+        const output = event.outputBuffer.getChannelData(0)
+        output.fill(0)
+      }
+
+      source.connect(processor)
+      processor.connect(audioContext.destination)
+
+      autoStopRef.current = setTimeout(() => {
+        void stopRecording()
+      }, maxSeconds * 1000)
+    } catch {
+      cleanupRecorder()
+      setState('error')
+      setTimeout(() => setState('idle'), 2000)
+    }
   }
 
   async function handleClick() {
     if (disabled) return
 
     if (state === 'recording') {
-      const recorder = mediaRecorderRef.current
-      if (recorder?.state === 'recording') {
-        try {
-          recorder.requestData()
-        } catch {
-          // Some browsers throw if no chunk is available yet; stop() will still
-          // trigger a final dataavailable event when possible.
-        }
-        recorder.stop()
-      }
+      await stopRecording()
       return
     }
 
     if (state !== 'idle') return
-
-    setState('recording')
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mimeType = getBestMimeType()
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream)
-      mediaRecorderRef.current = recorder
-      recordingStartedAtRef.current = Date.now()
-      const chunks: Blob[] = []
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data)
-      }
-
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop())
-        setState('transcribing')
-        try {
-          const blobType = recorder.mimeType || mimeType || 'audio/webm'
-          const blob = new Blob(chunks, { type: blobType })
-          const elapsedMs = Date.now() - recordingStartedAtRef.current
-          if (elapsedMs < 400 || blob.size < 1024) {
-            throw new Error(`Recording too short or empty (${blob.size} bytes)`)
-          }
-          const formData = new FormData()
-          formData.append('audio', blob, `recording.${extensionForMimeType(blobType)}`)
-
-          const res = await apiFetch('/api/stt', {
-            method: 'POST',
-            body: formData,
-          })
-          if (!res.ok) throw new Error(`STT error ${res.status}`)
-          const { text } = (await res.json()) as { text: string }
-          onTranscription(text)
-          setState('idle')
-        } catch {
-          setState('error')
-          setTimeout(() => setState('idle'), 2000)
-        }
-      }
-
-      // Request periodic chunks so short recordings still produce complete data
-      // before stop(); without this, some browsers can upload an undecodable blob.
-      recorder.start(250)
-      // Auto-stop after maxSeconds
-      setTimeout(() => {
-        if (recorder.state === 'recording') recorder.stop()
-      }, maxSeconds * 1000)
-    } catch {
-      setState('error')
-      setTimeout(() => setState('idle'), 2000)
-    }
+    await startRecording()
   }
 
   const label =
